@@ -1,0 +1,6 @@
+dist/
+tools/ffmpeg/
+tools/*.zip
+*.user
+*.suo
+
