@@ -7,8 +7,6 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
-using System.Windows.Forms.Integration;
-using WpfControls = System.Windows.Controls;
 
 namespace MovToSmallMp4
 {
@@ -19,13 +17,58 @@ namespace MovToSmallMp4
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs e)
+            {
+                StartupLog.Write("UI exception: " + e.Exception);
+                MessageBox.Show(e.Exception.Message, "MOV 转 MP4 启动/运行错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                StartupLog.Write("Unhandled exception: " + e.ExceptionObject);
+            };
+
+            try
+            {
+                StartupLog.Write("Starting app");
+                Application.Run(new MainForm());
+            }
+            catch (Exception ex)
+            {
+                StartupLog.Write("Startup exception: " + ex);
+                MessageBox.Show(
+                    "软件启动失败，错误已写入日志：\n" + StartupLog.PathName + "\n\n" + ex.Message,
+                    "MOV 转 MP4 启动失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+    }
+
+    internal static class StartupLog
+    {
+        public static readonly string PathName = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MovToSmallMp4",
+            "startup.log");
+
+        public static void Write(string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(PathName));
+                File.AppendAllText(PathName, DateTime.Now.ToString("s", CultureInfo.InvariantCulture) + " " + message + Environment.NewLine, Encoding.UTF8);
+            }
+            catch
+            {
+            }
         }
     }
 
     internal sealed class MainForm : Form
     {
-        private readonly WpfControls.MediaElement media;
+        private readonly PictureBox previewBox;
+        private readonly Label previewHint;
         private readonly TrackBar timeline;
         private readonly Label pathLabel;
         private readonly Label currentLabel;
@@ -39,14 +82,18 @@ namespace MovToSmallMp4
         private readonly ComboBox presetBox;
         private readonly ProgressBar progressBar;
         private readonly System.Windows.Forms.Timer playbackTimer;
+        private readonly System.Windows.Forms.Timer previewDebounceTimer;
 
         private string inputPath = "";
         private string outputPath = "";
+        private string ffmpegPath = "";
         private TimeSpan videoDuration = TimeSpan.Zero;
+        private TimeSpan currentTime = TimeSpan.Zero;
         private TimeSpan startTime = TimeSpan.Zero;
         private TimeSpan endTime = TimeSpan.Zero;
         private bool isPlaying;
-        private bool isSeeking;
+        private bool isPreviewRendering;
+        private int previewRequestId;
 
         public MainForm()
         {
@@ -57,14 +104,16 @@ namespace MovToSmallMp4
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
 
+            ffmpegPath = FindFfmpeg();
+
             var root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
             root.RowCount = 4;
             root.ColumnCount = 1;
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
             Controls.Add(root);
 
             var topBar = new FlowLayoutPanel();
@@ -82,50 +131,60 @@ namespace MovToSmallMp4
             topBar.Controls.Add(openButton);
 
             playButton = new Button();
-            playButton.Text = "播放";
-            playButton.Width = 80;
+            playButton.Text = "播放预览";
+            playButton.Width = 92;
             playButton.Height = 30;
             playButton.Enabled = false;
-            playButton.Click += delegate { TogglePlay(); };
+            playButton.Click += delegate { TogglePlayPreview(); };
             topBar.Controls.Add(playButton);
 
             pathLabel = new Label();
             pathLabel.Text = "未选择视频";
             pathLabel.AutoEllipsis = true;
             pathLabel.TextAlign = ContentAlignment.MiddleLeft;
-            pathLabel.Width = 760;
+            pathLabel.Width = 740;
             pathLabel.Height = 30;
             pathLabel.Margin = new Padding(12, 3, 0, 0);
             topBar.Controls.Add(pathLabel);
 
             var split = new SplitContainer();
             split.Dock = DockStyle.Fill;
-            split.SplitterDistance = 690;
-            split.Panel1MinSize = 480;
-            split.Panel2MinSize = 250;
             root.Controls.Add(split, 0, 1);
-
-            var videoPanel = new Panel();
-            videoPanel.Dock = DockStyle.Fill;
-            videoPanel.BackColor = Color.Black;
-            videoPanel.Padding = new Padding(0);
-            split.Panel1.Controls.Add(videoPanel);
-
-            media = new WpfControls.MediaElement();
-            media.LoadedBehavior = System.Windows.Controls.MediaState.Manual;
-            media.UnloadedBehavior = System.Windows.Controls.MediaState.Manual;
-            media.Stretch = System.Windows.Media.Stretch.Uniform;
-            media.MediaOpened += delegate { OnMediaOpened(); };
-            media.MediaEnded += delegate { OnMediaEnded(); };
-            media.MediaFailed += delegate(object sender, System.Windows.ExceptionRoutedEventArgs e)
+            Shown += delegate
             {
-                SetStatus("预览失败：这个 MOV 可能需要系统视频解码器，但仍可尝试导出 MP4。");
+                try
+                {
+                    split.Panel1MinSize = 480;
+                    split.Panel2MinSize = 250;
+                    if (split.Width > 760)
+                    {
+                        split.SplitterDistance = Math.Max(480, split.Width - 310);
+                    }
+                }
+                catch
+                {
+                }
             };
 
-            var host = new ElementHost();
-            host.Dock = DockStyle.Fill;
-            host.Child = media;
-            videoPanel.Controls.Add(host);
+            var previewPanel = new Panel();
+            previewPanel.Dock = DockStyle.Fill;
+            previewPanel.BackColor = Color.Black;
+            split.Panel1.Controls.Add(previewPanel);
+
+            previewBox = new PictureBox();
+            previewBox.Dock = DockStyle.Fill;
+            previewBox.BackColor = Color.Black;
+            previewBox.SizeMode = PictureBoxSizeMode.Zoom;
+            previewPanel.Controls.Add(previewBox);
+
+            previewHint = new Label();
+            previewHint.Dock = DockStyle.Fill;
+            previewHint.ForeColor = Color.WhiteSmoke;
+            previewHint.BackColor = Color.Black;
+            previewHint.TextAlign = ContentAlignment.MiddleCenter;
+            previewHint.Text = "选择 MOV/MP4 后，这里会显示预览画面";
+            previewPanel.Controls.Add(previewHint);
+            previewHint.BringToFront();
 
             var side = new TableLayoutPanel();
             side.Dock = DockStyle.Fill;
@@ -178,7 +237,7 @@ namespace MovToSmallMp4
             exportButton.Click += delegate { ExportMp4(); };
 
             var hint = new Label();
-            hint.Text = "提示：先播放预览，到需要的位置后点击“设为开始”或“设为结束”。";
+            hint.Text = "拖动时间条看画面，到需要的位置后设置开始/结束。";
             hint.Dock = DockStyle.Fill;
             hint.ForeColor = Color.DimGray;
             hint.AutoEllipsis = true;
@@ -209,9 +268,8 @@ namespace MovToSmallMp4
             timeline.Maximum = 10000;
             timeline.TickStyle = TickStyle.None;
             timeline.Enabled = false;
-            timeline.MouseDown += delegate { isSeeking = true; };
-            timeline.MouseUp += delegate { SeekFromTimeline(); isSeeking = false; };
-            timeline.Scroll += delegate { if (isSeeking) SeekFromTimeline(); };
+            timeline.Scroll += delegate { SeekFromTimeline(true); };
+            timeline.MouseUp += delegate { SeekFromTimeline(false); };
             timelinePanel.Controls.Add(timeline, 1, 0);
 
             durationLabel = new Label();
@@ -222,7 +280,7 @@ namespace MovToSmallMp4
 
             var rangeLabel = new Label();
             rangeLabel.Dock = DockStyle.Fill;
-            rangeLabel.Text = "选择片段后导出；不设置则导出完整视频。";
+            rangeLabel.Text = "预览是截帧预览；导出时会按选择片段压缩。";
             rangeLabel.ForeColor = Color.DimGray;
             rangeLabel.TextAlign = ContentAlignment.MiddleLeft;
             timelinePanel.Controls.Add(rangeLabel, 1, 1);
@@ -238,7 +296,9 @@ namespace MovToSmallMp4
 
             statusLabel = new Label();
             statusLabel.Dock = DockStyle.Fill;
-            statusLabel.Text = "准备就绪";
+            statusLabel.Text = string.IsNullOrWhiteSpace(ffmpegPath)
+                ? "缺少 ffmpeg.exe：请使用完整压缩包解压后运行。"
+                : "准备就绪";
             statusLabel.TextAlign = ContentAlignment.MiddleLeft;
             statusPanel.Controls.Add(statusLabel, 0, 0);
 
@@ -249,9 +309,16 @@ namespace MovToSmallMp4
             statusPanel.Controls.Add(progressBar, 1, 0);
 
             playbackTimer = new System.Windows.Forms.Timer();
-            playbackTimer.Interval = 250;
-            playbackTimer.Tick += delegate { UpdatePlaybackState(); };
-            playbackTimer.Start();
+            playbackTimer.Interval = 650;
+            playbackTimer.Tick += delegate { StepPreviewPlayback(); };
+
+            previewDebounceTimer = new System.Windows.Forms.Timer();
+            previewDebounceTimer.Interval = 280;
+            previewDebounceTimer.Tick += delegate
+            {
+                previewDebounceTimer.Stop();
+                RenderPreviewAsync(currentTime);
+            };
         }
 
         private static Label AddValue(TableLayoutPanel panel, string text, int col, int row)
@@ -288,6 +355,12 @@ namespace MovToSmallMp4
 
         private void OpenVideo()
         {
+            if (string.IsNullOrWhiteSpace(ffmpegPath))
+            {
+                MessageBox.Show(this, "没有找到 ffmpeg.exe。请解压完整压缩包后运行，不要只复制主程序。", "缺少 FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             using (var dialog = new OpenFileDialog())
             {
                 dialog.Filter = "视频文件|*.mov;*.mp4;*.m4v;*.qt|所有文件|*.*";
@@ -304,117 +377,105 @@ namespace MovToSmallMp4
 
                 pathLabel.Text = inputPath;
                 outputLabel.Text = outputPath;
-                videoDuration = TimeSpan.Zero;
-                startTime = TimeSpan.Zero;
-                endTime = TimeSpan.Zero;
                 progressBar.Value = 0;
-                timeline.Value = 0;
+                playButton.Enabled = false;
+                exportButton.Enabled = false;
                 timeline.Enabled = false;
-                playButton.Enabled = true;
-                exportButton.Enabled = true;
-                isPlaying = false;
-                playButton.Text = "播放";
-                SetTimeLabels();
+                SetStatus("正在读取视频信息...");
+                previewHint.Text = "正在读取视频信息...";
+                previewHint.Visible = true;
 
-                try
+                ThreadPool.QueueUserWorkItem(delegate
                 {
-                    media.Source = new Uri(inputPath);
-                    media.Position = TimeSpan.Zero;
-                    media.Play();
-                    media.Pause();
-                    SetStatus("已载入视频，可以预览和截切。");
-                }
-                catch (Exception ex)
-                {
-                    SetStatus("视频载入失败：" + ex.Message);
-                }
+                    try
+                    {
+                        var duration = ProbeDuration(inputPath);
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            videoDuration = duration;
+                            currentTime = TimeSpan.Zero;
+                            startTime = TimeSpan.Zero;
+                            endTime = videoDuration;
+                            timeline.Value = 0;
+                            timeline.Enabled = true;
+                            playButton.Enabled = true;
+                            exportButton.Enabled = true;
+                            SetTimeLabels();
+                            UpdateCurrentTimeLabel();
+                            SetStatus("已载入视频。拖动时间条可预览画面。");
+                            RenderPreviewAsync(TimeSpan.Zero);
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        StartupLog.Write("Probe failed: " + ex);
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            SetStatus("读取视频失败：" + ex.Message);
+                            previewHint.Text = "读取视频失败\n" + ex.Message;
+                            previewHint.Visible = true;
+                        });
+                    }
+                });
             }
         }
 
-        private void OnMediaOpened()
+        private TimeSpan ProbeDuration(string path)
         {
-            if (media.NaturalDuration.HasTimeSpan)
+            var stderr = RunProcessCapture(ffmpegPath, "-hide_banner -i " + Quote(path), 20000);
+            var match = Regex.Match(stderr, @"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", RegexOptions.IgnoreCase);
+            if (!match.Success)
             {
-                videoDuration = media.NaturalDuration.TimeSpan;
-                endTime = videoDuration;
-                timeline.Enabled = videoDuration.TotalMilliseconds > 0;
-                SetTimeLabels();
-                UpdateTimeline(media.Position);
-                SetStatus("已载入视频，可以预览和截切。");
+                throw new InvalidOperationException("无法识别视频时长。");
             }
+
+            var hours = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+            var minutes = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            var seconds = double.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture);
+            return TimeSpan.FromSeconds(hours * 3600 + minutes * 60 + seconds);
         }
 
-        private void OnMediaEnded()
+        private void TogglePlayPreview()
         {
-            isPlaying = false;
-            playButton.Text = "播放";
-            if (startTime < endTime)
-            {
-                media.Position = startTime;
-            }
-        }
-
-        private void TogglePlay()
-        {
-            if (string.IsNullOrWhiteSpace(inputPath))
-            {
-                return;
-            }
-
-            if (isPlaying)
-            {
-                media.Pause();
-                isPlaying = false;
-                playButton.Text = "播放";
-            }
-            else
-            {
-                if (endTime > startTime && media.Position >= endTime)
-                {
-                    media.Position = startTime;
-                }
-                media.Play();
-                isPlaying = true;
-                playButton.Text = "暂停";
-            }
-        }
-
-        private void UpdatePlaybackState()
-        {
-            if (string.IsNullOrWhiteSpace(inputPath) || isSeeking)
-            {
-                return;
-            }
-
-            var pos = media.Position;
-            if (endTime > startTime && pos >= endTime && isPlaying)
-            {
-                media.Pause();
-                isPlaying = false;
-                playButton.Text = "播放";
-                media.Position = startTime;
-                pos = startTime;
-            }
-
-            UpdateTimeline(pos);
-        }
-
-        private void UpdateTimeline(TimeSpan position)
-        {
-            currentLabel.Text = FormatTime(position);
             if (videoDuration.TotalMilliseconds <= 0)
             {
                 return;
             }
 
-            var ratio = Math.Max(0, Math.Min(1, position.TotalMilliseconds / videoDuration.TotalMilliseconds));
-            var value = (int)Math.Round(ratio * timeline.Maximum);
-            if (value < timeline.Minimum) value = timeline.Minimum;
-            if (value > timeline.Maximum) value = timeline.Maximum;
-            timeline.Value = value;
+            isPlaying = !isPlaying;
+            playButton.Text = isPlaying ? "暂停预览" : "播放预览";
+            if (isPlaying)
+            {
+                playbackTimer.Start();
+            }
+            else
+            {
+                playbackTimer.Stop();
+            }
         }
 
-        private void SeekFromTimeline()
+        private void StepPreviewPlayback()
+        {
+            if (!isPlaying)
+            {
+                return;
+            }
+
+            var next = currentTime + TimeSpan.FromMilliseconds(playbackTimer.Interval);
+            var stopAt = endTime > startTime ? endTime : videoDuration;
+            if (next >= stopAt)
+            {
+                next = startTime;
+                isPlaying = false;
+                playbackTimer.Stop();
+                playButton.Text = "播放预览";
+            }
+
+            SetCurrentTime(next);
+            RenderPreviewAsync(currentTime);
+        }
+
+        private void SeekFromTimeline(bool debounce)
         {
             if (videoDuration.TotalMilliseconds <= 0)
             {
@@ -422,9 +483,112 @@ namespace MovToSmallMp4
             }
 
             var ratio = (double)timeline.Value / timeline.Maximum;
-            var next = TimeSpan.FromMilliseconds(videoDuration.TotalMilliseconds * ratio);
-            media.Position = next;
-            currentLabel.Text = FormatTime(next);
+            SetCurrentTime(TimeSpan.FromMilliseconds(videoDuration.TotalMilliseconds * ratio));
+            if (debounce)
+            {
+                previewDebounceTimer.Stop();
+                previewDebounceTimer.Start();
+            }
+            else
+            {
+                previewDebounceTimer.Stop();
+                RenderPreviewAsync(currentTime);
+            }
+        }
+
+        private void SetCurrentTime(TimeSpan value)
+        {
+            if (value < TimeSpan.Zero)
+            {
+                value = TimeSpan.Zero;
+            }
+            if (videoDuration.TotalMilliseconds > 0 && value > videoDuration)
+            {
+                value = videoDuration;
+            }
+
+            currentTime = value;
+            if (videoDuration.TotalMilliseconds > 0)
+            {
+                var ratio = Math.Max(0, Math.Min(1, currentTime.TotalMilliseconds / videoDuration.TotalMilliseconds));
+                var nextValue = (int)Math.Round(ratio * timeline.Maximum);
+                if (nextValue < timeline.Minimum) nextValue = timeline.Minimum;
+                if (nextValue > timeline.Maximum) nextValue = timeline.Maximum;
+                if (timeline.Value != nextValue)
+                {
+                    timeline.Value = nextValue;
+                }
+            }
+            UpdateCurrentTimeLabel();
+        }
+
+        private void RenderPreviewAsync(TimeSpan position)
+        {
+            if (string.IsNullOrWhiteSpace(inputPath) || string.IsNullOrWhiteSpace(ffmpegPath) || isPreviewRendering)
+            {
+                return;
+            }
+
+            isPreviewRendering = true;
+            var requestId = ++previewRequestId;
+            SetStatus("正在生成预览画面...");
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string tempFile = "";
+                try
+                {
+                    tempFile = Path.Combine(Path.GetTempPath(), "movtosmallmp4_" + Guid.NewGuid().ToString("N") + ".jpg");
+                    var args = "-y -hide_banner -ss " + FormatForFfmpeg(position) +
+                               " -i " + Quote(inputPath) +
+                               " -frames:v 1 -q:v 3 " + Quote(tempFile);
+                    RunProcessCapture(ffmpegPath, args, 25000);
+
+                    if (!File.Exists(tempFile))
+                    {
+                        throw new InvalidOperationException("没有生成预览画面。");
+                    }
+
+                    var bytes = File.ReadAllBytes(tempFile);
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (requestId != previewRequestId)
+                        {
+                            return;
+                        }
+
+                        var old = previewBox.Image;
+                        using (var ms = new MemoryStream(bytes))
+                        {
+                            previewBox.Image = Image.FromStream(ms);
+                        }
+                        if (old != null)
+                        {
+                            old.Dispose();
+                        }
+                        previewHint.Visible = false;
+                        SetStatus("预览时间：" + FormatTime(position));
+                    });
+                }
+                catch (Exception ex)
+                {
+                    StartupLog.Write("Preview failed: " + ex.Message);
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        previewHint.Text = "预览失败\n仍可尝试导出 MP4\n\n" + ex.Message;
+                        previewHint.Visible = true;
+                        SetStatus("预览失败：" + ex.Message);
+                    });
+                }
+                finally
+                {
+                    if (!string.IsNullOrWhiteSpace(tempFile))
+                    {
+                        try { File.Delete(tempFile); } catch { }
+                    }
+                    isPreviewRendering = false;
+                }
+            });
         }
 
         private void SetStartFromCurrent()
@@ -434,7 +598,7 @@ namespace MovToSmallMp4
                 return;
             }
 
-            startTime = media.Position;
+            startTime = currentTime;
             if (endTime <= startTime)
             {
                 endTime = videoDuration;
@@ -449,7 +613,7 @@ namespace MovToSmallMp4
                 return;
             }
 
-            endTime = media.Position;
+            endTime = currentTime;
             if (endTime <= startTime)
             {
                 startTime = TimeSpan.Zero;
@@ -462,6 +626,11 @@ namespace MovToSmallMp4
             startLabel.Text = FormatTime(startTime);
             endLabel.Text = FormatTime(endTime);
             durationLabel.Text = FormatTime(videoDuration);
+        }
+
+        private void UpdateCurrentTimeLabel()
+        {
+            currentLabel.Text = FormatTime(currentTime);
         }
 
         private void ChooseOutputPath()
@@ -491,6 +660,12 @@ namespace MovToSmallMp4
                 return;
             }
 
+            if (string.IsNullOrWhiteSpace(ffmpegPath))
+            {
+                MessageBox.Show(this, "没有找到 ffmpeg.exe。请使用完整压缩包解压后运行。", "缺少 FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(outputPath))
             {
                 ChooseOutputPath();
@@ -498,13 +673,6 @@ namespace MovToSmallMp4
                 {
                     return;
                 }
-            }
-
-            var ffmpeg = FindFfmpeg();
-            if (string.IsNullOrWhiteSpace(ffmpeg))
-            {
-                MessageBox.Show(this, "没有找到 ffmpeg.exe。请使用打包版，或把 ffmpeg.exe 放到软件同一目录。", "缺少 FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
             }
 
             var cutEnd = endTime > startTime ? endTime : videoDuration;
@@ -515,9 +683,9 @@ namespace MovToSmallMp4
                 return;
             }
 
-            media.Pause();
             isPlaying = false;
-            playButton.Text = "播放";
+            playbackTimer.Stop();
+            playButton.Text = "播放预览";
             exportButton.Enabled = false;
             progressBar.Value = 0;
             SetStatus("正在导出 MP4...");
@@ -525,13 +693,13 @@ namespace MovToSmallMp4
             var args = BuildFfmpegArgs(inputPath, outputPath, startTime, cutDuration);
             var worker = new Thread(delegate()
             {
-                RunFfmpeg(ffmpeg, args, cutDuration);
+                RunFfmpegForExport(ffmpegPath, args, cutDuration);
             });
             worker.IsBackground = true;
             worker.Start();
         }
 
-        private void RunFfmpeg(string ffmpeg, string args, TimeSpan cutDuration)
+        private void RunFfmpegForExport(string ffmpeg, string args, TimeSpan cutDuration)
         {
             var lastLines = new StringBuilder();
             try
@@ -598,6 +766,7 @@ namespace MovToSmallMp4
             }
             catch (Exception ex)
             {
+                StartupLog.Write("Export failed: " + ex);
                 BeginInvoke((MethodInvoker)delegate
                 {
                     exportButton.Enabled = true;
@@ -637,7 +806,55 @@ namespace MovToSmallMp4
                    " -movflags +faststart " + Quote(output);
         }
 
-        private string FindFfmpeg()
+        private static string RunProcessCapture(string exe, string args, int timeoutMs)
+        {
+            var startInfo = new ProcessStartInfo();
+            startInfo.FileName = exe;
+            startInfo.Arguments = args;
+            startInfo.UseShellExecute = false;
+            startInfo.CreateNoWindow = true;
+            startInfo.RedirectStandardError = true;
+            startInfo.RedirectStandardOutput = true;
+
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                {
+                    throw new InvalidOperationException("无法启动进程。");
+                }
+
+                var output = new StringBuilder();
+                var stderr = new StringBuilder();
+                var outDone = new ManualResetEvent(false);
+                var errDone = new ManualResetEvent(false);
+
+                process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null) outDone.Set();
+                    else output.AppendLine(e.Data);
+                };
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null) errDone.Set();
+                    else stderr.AppendLine(e.Data);
+                };
+
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+
+                if (!process.WaitForExit(timeoutMs))
+                {
+                    try { process.Kill(); } catch { }
+                    throw new TimeoutException("FFmpeg 执行超时。");
+                }
+
+                outDone.WaitOne(1000);
+                errDone.WaitOne(1000);
+                return output.ToString() + Environment.NewLine + stderr.ToString();
+            }
+        }
+
+        private static string FindFfmpeg()
         {
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var candidates = new[]
