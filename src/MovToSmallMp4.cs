@@ -747,19 +747,22 @@ namespace MovToSmallMp4
                     }
 
                     process.WaitForExit();
+                    var exitCode = process.ExitCode;
+                    var completedOutputPath = outputPath;
+                    var ffmpegLog = lastLines.ToString();
                     BeginInvoke((MethodInvoker)delegate
                     {
                         exportButton.Enabled = true;
-                        if (process.ExitCode == 0 && File.Exists(outputPath))
+                        if (exitCode == 0 && File.Exists(completedOutputPath))
                         {
                             progressBar.Value = 100;
-                            SetStatus("导出完成：" + outputPath);
+                            SetStatus("导出完成：" + completedOutputPath);
                             MessageBox.Show(this, "MP4 已导出完成。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
                         }
                         else
                         {
                             SetStatus("导出失败，请检查视频文件。");
-                            MessageBox.Show(this, "FFmpeg 导出失败。\n\n" + TrimForMessage(lastLines.ToString()), "导出失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            MessageBox.Show(this, "FFmpeg 导出失败。\n\n" + TrimForMessage(ffmpegLog), "导出失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
                     });
                 }
